@@ -396,8 +396,8 @@ def authWP(device, username, password, user_agent):
 def authEWS(username, password):
     print("=== Logging into Exchange Web Services ===")
     credentials = Credentials(username=username, password=password)
-    account = Account(primary_smtp_address=username, credentials=credentials,autodiscover=True)
     try:
+        account = Account(primary_smtp_address=username, credentials=credentials,autodiscover=True)
         # Retrieve subject line of latest email to verify. Will have to find a better way in the future but this works for now.
         # This will throw an exception if the credentials are invalid.
         last_email = account.inbox.all().order_by('-datetime_received')[0]
