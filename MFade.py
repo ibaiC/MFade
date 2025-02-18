@@ -1,6 +1,10 @@
+#!/usr/bin/env python3
 import argparse
 import sys
+import os
 import requests
+import tempfile
+
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
@@ -10,14 +14,63 @@ import json
 from exchangelib import Account, Credentials
 import base64
 import random
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.firefox.options import Options
+
+__authors__ = ["kreep", "phyu"]
+__version__ = 1.01
 
 
-"""
-Author: kreep
-Twitter: @kreepsec
+f"""
+Authors: {__authors__}
+Twitter: @kreepsec, @nihsuyhp
 License: MIT
 """
 
+tmp_file = "/tmp/request.html" ## default temp
+
+# helper class for colour printing
+class PP:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+    def __init__(self):
+        self.init = True
+
+    def warning(self ,words):
+        print(f'[{self.WARNING}+{self.ENDC}] {words}')
+
+    def success(self, words):
+        print(f'[{self.OKGREEN}*{self.ENDC}] {words}')
+
+    def error(self, words):
+        print(f'[{self.FAIL}-{self.ENDC}] {words}')
+
+    def info(self, words):
+        print(f'[{self.OKCYAN}i{self.ENDC}] {words}')
+
+    def debug(self, words):
+        print(f" - [{self.OKCYAN}dbg{self.ENDC}] - {words}\n\n")
+    
+    ## these are to colour text 
+    ## TODO: rewrite to use RICH
+
+    def green(self, words):
+        return (f'{self.OKGREEN}{words}{self.ENDC}')
+
+    def red(self, words):
+        return (f"{self.WARNING}{words}{self.ENDC}")
+
+
+pp = PP()
 exclude_mappings = """
 'gapi' : "Microsoft Graph API",
 'asm' : "Azure Service Management",
@@ -43,34 +96,13 @@ parser.add_argument('--sleep', '-s', type=int, help='OPSEC: how long to sleep be
 parser.add_argument('--jitter', '-j', type=int, help='OPSEC: percentage change added to sleep value for further sleep randomisation (0-100)')
 parser.add_argument('--ioc', action="store_true", help='OPSEC: Print a report with the generated HTTP request times and their corresponding target URLs')
 parser.add_argument('--exclude','-e', help="OPSEC: Exclude given checks. Provide the checks to exclude as a comma-separated list. Possible values are: gapi,asm,ews,as,mwp-W,mwp-L,mwp-M,mwp-A,mwp-I,mwp-wp. Check the source code for mappings")
+parser.add_argument('--debug', action="store_true", help='Add Debugging info (prints out responses to allow you to see the actual message)')
+
 
 args = parser.parse_args()
 if len(sys.argv) < 2:
     parser.print_usage()
     sys.exit(1)
-
-# helper class for colour printing
-class pp:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKCYAN = '\033[96m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[93m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
-
-    def warning(words):
-        print('\033[93m' + '[+] ' + '\033[0m' + words)
-    def success(words):
-        print('\033[92m' + '[*] ' + '\033[0m' + words)
-    def error(words):
-        print('\033[91m' + '[-] ' + '\033[0m' + words)
-    def info(words):
-        print('\033[96m' + '[i] ' + '\033[0m' + words)
-    def green(words):
-        return '\033[92m' + words + '\033[0m'
 
 # Class to hold IOCs - just http authentication requests for now.
 class Iocs:
@@ -82,6 +114,12 @@ class Iocs:
 
 iocs_instance = Iocs()
 
+
+def check_text_in_elements(text,tags):
+    for t in tags:
+        if text.lower() in t:
+            return True
+    return False
 #  ======  Functionality starts here ======
 # Print the list of checks that will be done
 def showChecks(excluded):
@@ -116,12 +154,14 @@ def reconADFS(username):
     try:
         root_adfs_url = urlparse(adfsxml.find('AuthURL').text)
         adfs_domain = root_adfs_url.netloc
-        if adfsxml.find('NameSpaceType').text == "Federated":
+        namespace_type = adfsxml.find('NameSpaceType').text
+
+        if namespace_type == "Federated":
             return root_adfs_url,adfs_domain
-        elif adfsxml.find('NameSpaceType').text == "Managed":
+        elif namespace_type == "Managed":
             pp.warning("ADFS does not appear to be in use. Authentication appears to be managed by Microsoft.")
             return root_adfs_url,adfs_domain
-        elif adfsxml.find('NameSpaceType').text == "Unknown":
+        elif namespace_type == "Unknown":
             pp.warning("The target email is not linked to Microsoft Online or O365. Authentication will most likely fail.")
             return root_adfs_url,adfs_domain
         return False,False
@@ -143,14 +183,14 @@ def authADFS(username, password):
         userform.find('input', {'name': 'Password'})['value'] = password
         userform.find('input', {'name': 'AuthMethod'})['value'] = "FormsAuthentication"
         adfsauthpath = userform['action']
-        full_adfs_url = "https://" + adfs_domain + adfsauthpath
+        full_adfs_url = f"https://{adfs_domain}{adfsauthpath}"
         adfs_auth_attempt = adfs_session.post(full_adfs_url, data=userform.fields)
 
         if "MSISAUTH" in [cookie.name for cookie in adfs_session.cookies]:
             pp.success("Success! We can authenticate to ADFS.")
             pp.warning("NOTE: This part may open a browser. If closed immediately it may prevent an SMS/call to the user.")
             for i in range(5, 0, -1):
-                pp.warning("Sending Auth Request in {}...\r".format(i), end="")
+                pp.warning("Sending Auth Request in {i}...\r", end="")
                 time.sleep(1)
 
             adfs_srf_auth = adfs_session.post("https://login.microsoftonline.com/login.srf", data=adfs_auth_attempt.forms[0].fields, allow_redirects=False)
@@ -158,7 +198,7 @@ def authADFS(username, password):
                 pp.success("There is no MFA for this account.")
                 pp.success(f"Login with a web browser to {full_adfs_url}")
                 for cookie in adfs_session.cookies:
-                    print("{} = {}".format(cookie.name, cookie.value))
+                    pp.info(f"{cookie.name} = {cookie.value}")
             elif adfs_srf_auth.status_code == 302:
                 if "device.login.microsoftonline.com" in adfs_srf_auth.headers["Location"]:
                     pp.warning("Redirected after login. MFA is in place to SMS or Call the user.")
@@ -199,8 +239,11 @@ def authGAPI(username, password):
     'Content-Type': 'application/x-www-form-urlencoded'
     }
 
-    final_url = url + "/common/oauth2/token" 
+    final_url = f"{url}/common/oauth2/token" 
     response = requests.post(final_url, data=body_params, headers=headers)
+    if args.debug:
+        pp.debug(f"[authGAPI] - {response.text}")
+
     if args.ioc:
         req = (response.url,response.headers.get('date'))
         iocs_instance.add_to_list(req)
@@ -216,29 +259,31 @@ def authGAPI(username, password):
             pp.error(" Login appears to have failed.")
         # Invalid Tenant Response
         elif "AADSTS50128" in response.text or "AADSTS50059" in response.text:
-            pp.error("  Tenant for account {} doesn't exist. Check the domain to make sure they are using Azure/O365 services.".format(username))
+            pp.error(f"  Tenant for account {username} doesn't exist. Check the domain to make sure they are using Azure/O365 services.")
         # Invalid Username
         elif "AADSTS50034" in response.text:
-            pp.error("  The user {} doesn't exist.".format(username))
+            pp.error(f"  The user {username} doesn't exist.")
         # Microsoft MFA response
         elif "AADSTS50079" in response.text or "AADSTS50076" in response.text:
-            pp.error(" SUCCESS! {} was able to authenticate to the Microsoft Graph API - NOTE: The response indicates MFA (Microsoft) is in use.".format(username))
+            pp.error(f" SUCCESS! {username} was able to authenticate to the Microsoft Graph API - NOTE: The response indicates MFA (Microsoft) is in use.")
         # Conditional Access response (Based off of limited testing this seems to be the repsonse to DUO MFA)
         elif "AADSTS50158" in response.text:
-            pp.error(" SUCCESS! {} was able to authenticate to the Microsoft Graph API - NOTE: The response indicates conditional access (MFA: DUO or other) is in use.".format(username))
+            pp.error(f" SUCCESS! {username} was able to authenticate to the Microsoft Graph API - NOTE: The response indicates conditional access (MFA: DUO or other) is in use.")
         # Locked out account or Smart Lockout in place
         elif "AADSTS50053" in response.text:
-            pp.error("  The account {} appears to be locked.".format(username))
+            pp.error(f"  The account {username} appears to be locked.")
         # Disabled account
         elif "AADSTS50057" in response.text:
-            pp.error("  The account {} appears to be disabled.".format(username))
+            pp.error(f"  The account {username} appears to be disabled.")
         # User password is expired
         elif "AADSTS50055" in response.text:
-            pp.error(" SUCCESS! {} was able to authenticate to the Microsoft Graph API - NOTE: The user's password is expired.".format(username))
+            pp.error(f" SUCCESS! {username} was able to authenticate to the Microsoft Graph API - NOTE: The user's password is expired.")
         # Unknown errors
         else:
-            pp.error(" We received an unknown error for the user: {}".format(username))
+            pp.error(f" We received an unknown error for the user: {username}")
             # print(response.text)
+        if args.debug:
+            pp.debug(f"[authGAPI:response] - {response.text}")
         return False
 
 def authASM(username, password):
@@ -258,11 +303,17 @@ def authASM(username, password):
     'Content-Type': 'application/x-www-form-urlencoded'
     }
 
-    final_url = url + "/Common/oauth2/token" 
+    final_url = f"{url}/Common/oauth2/token" 
     response = requests.post(final_url, data=body_params, headers=headers)
+    if args.debug:
+        pp.debug(f"[AuthASM]: {response.text}")
+    
     if args.ioc:
         req = (response.url,response.headers.get('date'))
         iocs_instance.add_to_list(req)
+        if args.debug:
+            pp.debug(f"[AuthASM - and IOC]:")
+
 
     if response.status_code == 200:
         pp.success(f"Success! {username} is able to authenticate to the Microsoft Service Management API")
@@ -275,29 +326,33 @@ def authASM(username, password):
             pp.error(" Login appears to have failed.")
         # Invalid Tenant Response
         elif "AADSTS50128" in response.text or "AADSTS50059" in response.text:
-            pp.error("  Tenant for account {} doesn't exist. Check the domain to make sure they are using Azure/O365 services.".format(username))
+            pp.error(f"  Tenant for account {username} doesn't exist. Check the domain to make sure they are using Azure/O365 services.")
         # Invalid Username
         elif "AADSTS50034" in response.text:
-            pp.error("  The user {} doesn't exist.".format(username))
+            pp.error(f"  The user {username} doesn't exist.")
         # Microsoft MFA response
         elif "AADSTS50079" in response.text or "AADSTS50076" in response.text:
-            pp.error(" SUCCESS! {} was able to authenticate to the Microsoft Graph API - NOTE: The response indicates MFA (Microsoft) is in use.".format(username))
+            pp.error(f" SUCCESS! {username} was able to authenticate to the Microsoft Graph API - NOTE: The response indicates MFA (Microsoft) is in use.")
         # Conditional Access response (Based off of limited testing this seems to be the repsonse to DUO MFA)
         elif "AADSTS50158" in response.text:
-            pp.error(" SUCCESS! {} was able to authenticate to the Microsoft Graph API - NOTE: The response indicates conditional access (MFA: DUO or other) is in use.".format(username))
+            pp.error(f" SUCCESS! {username} was able to authenticate to the Microsoft Graph API - NOTE: The response indicates conditional access (MFA: DUO or other) is in use.")
         # Locked out account or Smart Lockout in place
         elif "AADSTS50053" in response.text:
-            pp.error("  The account {} appears to be locked.".format(username))
+            pp.error(f"  The account {username} appears to be locked.")
         # Disabled account
         elif "AADSTS50057" in response.text:
-            pp.error("  The account {} appears to be disabled.".format(username))
+            pp.error(f"  The account {username} appears to be disabled.")
         # User password is expired
         elif "AADSTS50055" in response.text:
-            pp.error(" SUCCESS! {} was able to authenticate to the Microsoft Graph API - NOTE: The user's password is expired.".format(username))
+            pp.error(f" SUCCESS! {username} was able to authenticate to the Microsoft Graph API - NOTE: The user's password is expired.")
         # Unknown errors
         else:
-            pp.error(" We received an unknown error for the user: {}".format(username))
+            pp.error(f" We received an unknown error for the user: {username}")
             # print(response.text)
+
+        
+        if args.debug:
+            pp.debug(f"[AuthASM:error]: {response.text}")
         return False
 
 def authWP(device, username, password, user_agent):
@@ -305,9 +360,15 @@ def authWP(device, username, password, user_agent):
     o365 = requests.Session()
     headers = {"User-Agent": user_agent}
     response = o365.get('https://outlook.office365.com', headers=headers)
+
+    if args.debug:
+        pp.debug(f"[AuthWP - Create Session]: {response.text}")
     if args.ioc:
         req = (response.url,response.headers.get('date'))
         iocs_instance.add_to_list(req)
+        if args.debug:
+            pp.debug(f"[AuthWP - add IOC {req}")
+
     partialctx_pattern = re.compile(r'urlLogin":".*?"')
     partialctx = partialctx_pattern.findall(response.text)
 
@@ -336,8 +397,13 @@ def authWP(device, username, password, user_agent):
     }
 
     json_form = json.dumps(userform)
+
     url = "https://login.microsoftonline.com/common/GetCredentialType?mkt=en-US"
     response = o365.post(url, headers=headers, json=json_form)
+    
+    if args.debug:
+        pp.debug(f"[AuthWP - response]: {response.text}")
+
     if args.ioc:
         req = (response.url,response.headers.get('date'))
         iocs_instance.add_to_list(req)
@@ -376,20 +442,66 @@ def authWP(device, username, password, user_agent):
 
     response = o365.post("https://login.microsoftonline.com/common/login", headers=headers, data=auth_body)
 
+    if args.debug:
+#        pp.debug(f"[AuthWP - response]: {response.text}")
+        pp.debug(f"session: {o365.cookies}")
+        cookies = "cookies:\n"
+        for c in o365.cookies:
+            cookies = f"{c.name} {c.value}\n"
+
+
+        pp.debug(f"[AuthWP]:{cookies}")
+
     if args.ioc:
         req = (response.url,response.headers.get('date'))
         iocs_instance.add_to_list(req)
-
+#check here
     if "ESTSAUTH" in [cookie.name for cookie in o365.cookies]:
         pp.success(f"SUCCESS! {username} was able to authenticate to the Microsoft 365 Web Portal. Checking MFA now...")
-        if "Stay signed in" in response.text:
+        if args.debug:
+            pp.debug(f"checking for 2fa \n\n\n{response.text}")
+        
+        ## selenium here 
+        _options = Options()
+        _options.add_argument('--headless')
+        driver = webdriver.Firefox(options=_options)
+        ## awful hack xD
+
+        tags = []
+        #with open(tmp_file,"w") as f:
+        with tempfile.NamedTemporaryFile() as fp:
+            if args.debug:
+                pp.debug(f"file created {fp.name}")
+            with open(fp.name,"w") as f:
+                f.write(response.text)
+
+            if args.debug:
+                with open("/tmp/response.html","w") as f: ## debug
+                    f.write(response.text)
+
+            driver.get(f"file://{fp.name}")
+            divs= driver.find_elements(By.TAG_NAME,"div")
+     
+
+        for t in divs:
+            if args.debug:
+                pp.debug(f"div:{t.text.lower()}")
+            tags.append(t.text.lower())
+
+
+        if check_text_in_elements("Stay signed in",tags):
             pp.success("It appears there is no MFA for this account.")
             pp.success(f"Login with a {device}-based web browser to https://outlook.office365.com. Ex: {user_agent}")
             return True
-        elif "Verify your identity" in response.text:
-            pp.error("MFA for Microsoft 365 via the web portal is enabled.")
-            return False
+        if (check_text_in_elements("Verify your identity", tags) or 
+            check_text_in_elements("approve sign in request",tags)):
 
+        #elif "Verify your identity" in response.text:
+            pp.error("MFA for Microsoft 365 via the web portal is enabled.")
+            driver.quit()
+            return False
+    
+    
     pp.error("Login failed.")
     return False
 
@@ -397,7 +509,7 @@ def authEWS(username, password):
     print("=== Logging into Exchange Web Services ===")
     credentials = Credentials(username=username, password=password)
     try:
-        account = Account(primary_smtp_address=username, credentials=credentials,autodiscover=True)
+        account = Account(primary_smtp_address=username, credentials=credentials, autodiscover=True)
         # Retrieve subject line of latest email to verify. Will have to find a better way in the future but this works for now.
         # This will throw an exception if the credentials are invalid.
         last_email = account.inbox.all().order_by('-datetime_received')[0]
@@ -431,7 +543,9 @@ def authAS(username, password):
 def jittered_sleep(stime,jitter=1):
     if args.sleep or args.jitter:
         jitter_range = stime * jitter / 100
-        stime += random.uniform(-jitter_range, jitter_range)
+        stime += round(random.uniform(-jitter_range, jitter_range),4)
+        if stime< 0:
+            stime = stime*-1 # if the stime is negative remove the negative
         pp.warning(f"OPSEC: Sleeping {stime} seconds...")
         time.sleep(stime)
         return
@@ -451,16 +565,17 @@ def main():
     mwpwp_success = False
     asm_success = False
     as_success = False
-    
+
+
     # pp.success("Starting MFA black magic...")
-    ascii_art = """
+    ascii_art = f"""
 ___  _________        _      
 |  \/  ||  ___|      | |     
 | .  . || |_ __ _  __| | ___ 
 | |\/| ||  _/ _` |/ _` |/ _ \\
 | |  | || || (_| | (_| |  __/
 \_|  |_/\_| \__,_|\__,_|\___|
-                             
+        Version:{__version__}            
     """
     print(ascii_art)
     print("\n")
@@ -517,32 +632,21 @@ ___  _________        _
     # Printing results
     print("\n")
     pp.info("=== SINGLE FACTOR ACCESS RESULTS: ===")
-    gapi_result = pp.green("YES") if gapi_success else "NO"
-    asm_result = pp.green("YES") if asm_success else "NO"
-    mwpw_result = pp.green("YES") if mwpw_success else "NO"
-    mwpl_result = pp.green("YES") if mwpl_success else "NO"
-    mwpm_result = pp.green("YES") if mwpm_success else "NO"
-    mwpa_result = pp.green("YES") if mwpa_success else "NO"
-    mwpi_result = pp.green("YES") if mwpi_success else "NO"
-    mwpwp_result = pp.green("YES") if mwpwp_success else "NO"
-    ews_result = pp.green("YES") if ews_success else "NO"
-    adfs_result = pp.green("YES") if adfs_domain else "NO"
-    adfs_login_result = pp.green("YES") if adfs_login_success else "NO"
-    as_result = pp.green("YES") if as_success else "NO"
+
     
     results = f"""
-    Microsoft Graph API\t\t\t\t\t{gapi_result}
-    Microsoft Service Management API\t\t\t{asm_result}
-    Microsoft 365 Web Portal w/ Windows User Agent\t{mwpw_result}
-    Microsoft 365 Web Portal w/ Linux User Agent\t{mwpl_result}
-    Microsoft 365 Web Portal w/ Mac OS User Agent\t{mwpm_result}
-    Microsoft 365 Web Portal w/ Android User Agent\t{mwpa_result}
-    Microsoft 365 Web Portal w/ iPhone User Agent\t{mwpi_result}
-    Microsoft 365 Web Portal w/ Win Phone User Agent\t{mwpwp_result}
-    Exchange Web Services\t\t\t\t{ews_result}
-    Active Sync\t\t\t\t\t\t{as_result}
-    ADFS found\t\t\t\t\t\t{adfs_result}
-    ADFS Auth\t\t\t\t\t\t{adfs_login_result}
+    Microsoft Graph API\t\t\t\t\t{ pp.green("YES") if gapi_success else pp.red("NO")}
+    Microsoft Service Management API\t\t\t{ pp.green("YES") if asm_success else pp.red("NO")}
+    Microsoft 365 Web Portal w/ Windows User Agent\t{ pp.green("YES") if mwpw_success else pp.red("NO")}
+    Microsoft 365 Web Portal w/ Linux User Agent\t{ pp.green("YES") if mwpl_success else pp.red("NO")}
+    Microsoft 365 Web Portal w/ Mac OS User Agent\t{ pp.green("YES") if mwpm_success else pp.red("NO")}
+    Microsoft 365 Web Portal w/ Android User Agent\t{ pp.green("YES") if mwpa_success else pp.red("NO")}
+    Microsoft 365 Web Portal w/ iPhone User Agent\t{ pp.green("YES") if mwpi_success else pp.red("NO")}
+    Microsoft 365 Web Portal w/ Win Phone User Agent\t{ pp.green("YES") if mwpwp_success else pp.red("NO")}
+    Exchange Web Services\t\t\t\t{pp.green("YES") if ews_success else pp.red("NO")}
+    Active Sync\t\t\t\t\t\t{ pp.green("YES") if adfs_domain else pp.red("NO")}
+    ADFS found\t\t\t\t\t\t{ pp.green("YES") if adfs_login_success else pp.red("NO")}
+    ADFS Auth\t\t\t\t\t\t{ pp.green("YES") if as_success else pp.red("NO")}
     """
     print(results)
     print('\n')
@@ -554,5 +658,4 @@ ___  _________        _
 
 if __name__ == "__main__":
     main()
-
 
