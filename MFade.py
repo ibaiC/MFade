@@ -305,44 +305,470 @@ def authASM(username, password):
             pp.debug(f"[AuthASM:error]: {response.text}")
         return False
 
+def authWP_direct(device, username, password, user_agent, session, headers):
+    """Direct authentication approach for the new Microsoft login flow"""
+    if args.debug:
+        pp.debug(f"[AuthWP_direct] - Using direct authentication approach")
+    
+    try:
+        # Try to authenticate directly to Microsoft login endpoint
+        login_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+        
+        # Prepare authentication data for OAuth 2.0
+        auth_data = {
+            "grant_type": "password",
+            "client_id": "00000002-0000-0ff1-ce00-000000000000",  # Office 365 client ID
+            "username": username,
+            "password": password,
+            "scope": "https://outlook.office365.com/.default openid profile email"
+        }
+        
+        response = session.post(login_url, data=auth_data, headers=headers)
+        if args.debug:
+            pp.debug(f"[AuthWP_direct - Token Response]: {response.text}")
+        if args.ioc:
+            req = (response.url, response.headers.get('date'))
+            iocs_instance.add_to_list(req)
+        
+        if response.status_code == 200:
+            try:
+                token_data = response.json()
+                if "access_token" in token_data:
+                    # Use the access token to access Outlook
+                    outlook_headers = headers.copy()
+                    outlook_headers["Authorization"] = f"Bearer {token_data['access_token']}"
+                    
+                    outlook_response = session.get("https://outlook.office365.com/", headers=outlook_headers)
+                    if args.debug:
+                        pp.debug(f"[AuthWP_direct - Outlook Response]: Status {outlook_response.status_code}")
+                    
+                    if outlook_response.status_code == 200:
+                        pp.success(f"SUCCESS! {username} was able to authenticate to the Microsoft 365 Web Portal via direct token flow.")
+                        return True
+            except json.JSONDecodeError:
+                if args.debug:
+                    pp.debug(f"[AuthWP_direct] - Failed to decode JSON response")
+        
+        # If direct token approach fails, try browser-based approach
+        return authWP_browser_fallback(device, username, password, user_agent, session, headers)
+        
+    except Exception as e:
+        if args.debug:
+            pp.debug(f"[AuthWP_direct] - Exception: {str(e)}")
+        # Try simple modern flow as last resort
+        return authWP_modern_flow(device, username, password, user_agent, session, headers)
+
+def authWP_modern_flow(device, username, password, user_agent, session, headers):
+    """Modern Microsoft login flow using the actual current authentication endpoints"""
+    if args.debug:
+        pp.debug(f"[AuthWP_modern_flow] - Using modern authentication flow")
+    
+    try:
+        # Step 1: First, try to get credential type 
+        cred_url = "https://login.microsoftonline.com/common/GetCredentialType"
+        cred_data = {
+            "username": username,
+            "isOtherIdpSupported": "true",
+            "checkPhones": "false",
+            "isRemoteNGCSupported": "true",
+            "isCookieBannerShown": "false",
+            "isFidoSupported": "true",
+            "country": "US",
+            "forceotclogin": "false",
+            "isExternalFederationDisallowed": "false",
+            "isRemoteConnectSupported": "false",
+            "federationFlags": "0",
+            "isSignup": "false",
+            "isAccessPassSupported": "true"
+        }
+        
+        cred_response = session.post(cred_url, json=cred_data, headers=headers)
+        if args.debug:
+            pp.debug(f"[AuthWP_modern_flow - Cred]: Status {cred_response.status_code}")
+            pp.debug(f"[AuthWP_modern_flow - Cred]: Response {cred_response.text}")
+        
+        if args.ioc:
+            req = (cred_response.url, cred_response.headers.get('date'))
+            iocs_instance.add_to_list(req)
+        
+        # Check if we can proceed
+        if cred_response.status_code == 200:
+            try:
+                cred_json = cred_response.json()
+                if cred_json.get("IfExistsResult", 0) == 0:
+                    # User exists, try to authenticate
+                    flow_token = cred_json.get("FlowToken", "") or cred_json.get("apiCanary", "")
+                    
+                    if flow_token:
+                        # Step 2: Try to authenticate with the flow token using proper parameters
+                        auth_url = "https://login.microsoftonline.com/common/login"
+                        auth_data = {
+                            "login": username,
+                            "loginfmt": username,
+                            "passwd": password,
+                            "LoginOptions": "3",
+                            "type": "11",
+                            "flowToken": flow_token,
+                            "canary": flow_token,  # Use the same token for canary
+                            "ps": "2",
+                            "psRNGCDefaultType": "",
+                            "psRNGCEntropy": "",
+                            "psRNGCSLK": "",
+                            "i13": "0",
+                            "NewUser": "1",
+                            "FoundMSAs": "",
+                            "fspost": "0",
+                            "i21": "0",
+                            "CookieDisclosure": "0",
+                            "IsFidoSupported": "1",
+                            "isSignupPost": "0",
+                            "i2": "1",
+                            "i17": "",
+                            "i18": "",
+                            "i19": "198733"
+                        }
+                        
+                        auth_response = session.post(auth_url, data=auth_data, headers=headers, allow_redirects=True)
+                        if args.debug:
+                            pp.debug(f"[AuthWP_modern_flow - Auth]: Status {auth_response.status_code}")
+                            pp.debug(f"[AuthWP_modern_flow - Auth]: URL {auth_response.url}")
+                            pp.debug(f"[AuthWP_modern_flow - Auth]: Cookies {[c.name for c in session.cookies]}")
+                        
+                        if args.ioc:
+                            req = (auth_response.url, auth_response.headers.get('date'))
+                            iocs_instance.add_to_list(req)
+                        
+                        # Check for success
+                        auth_cookies = ["ESTSAUTH", "ESTSAUTHPERSISTENT", "ESTSAUTHLIGHT"]
+                        has_auth_cookie = any(cookie.name in auth_cookies for cookie in session.cookies)
+                        
+                        if has_auth_cookie:
+                            pp.success(f"SUCCESS! {username} was able to authenticate to the Microsoft 365 Web Portal. Checking MFA now...")
+                            
+                            # Check for MFA indicators
+                            response_lower = auth_response.text.lower()
+                            if "stay signed in" in response_lower or "keep me signed in" in response_lower:
+                                pp.success("It appears there is no MFA for this account.")
+                                pp.success(f"Login with a {device}-based web browser to https://outlook.office365.com. Ex: {user_agent}")
+                                return True
+                            elif "verify your identity" in response_lower or "approve sign in request" in response_lower:
+                                pp.error("MFA for Microsoft 365 via the web portal is enabled.")
+                                return False
+                            else:
+                                pp.success("Authentication successful, but MFA status unclear.")
+                                return True
+                        else:
+                            # Check for MFA requirements without successful cookie
+                            response_lower = auth_response.text.lower()
+                            if "aadsts50079" in response_lower or "aadsts50076" in response_lower:
+                                pp.error(f"SUCCESS! {username} was able to authenticate to the Microsoft 365 Web Portal - NOTE: MFA is enabled.")
+                                return False
+                            elif "verify your identity" in response_lower:
+                                pp.error(f"SUCCESS! {username} was able to authenticate to the Microsoft 365 Web Portal - NOTE: MFA is enabled.")
+                                return False
+                            else:
+                                # Check for specific error messages
+                                response_lower = auth_response.text.lower()
+                                if "aadsts50126" in response_lower:
+                                    pp.error("Invalid username or password.")
+                                    return False
+                                elif "aadsts900043" in response_lower or "context cannot be parsed" in response_lower:
+                                    pp.error("Authentication context error. The Microsoft login flow may have changed.")
+                                    return False
+                                else:
+                                    if args.debug:
+                                        pp.debug(f"[AuthWP_modern_flow] - Auth response: {auth_response.text[:1000]}...")
+                                    pp.error("Login failed to Microsoft 365 Web Portal.")
+                                    return False
+                    else:
+                        pp.error("No flow token received from Microsoft login service.")
+                        return False
+                else:
+                    pp.error(f"User {username} does not exist or cannot be authenticated.")
+                    return False
+                    
+            except json.JSONDecodeError:
+                if args.debug:
+                    pp.debug(f"[AuthWP_modern_flow] - Failed to decode credential response")
+                pp.error("Failed to process Microsoft login response.")
+                return False
+        else:
+            pp.error("Failed to get credential type from Microsoft login service.")
+            return False
+            
+    except Exception as e:
+        if args.debug:
+            pp.debug(f"[AuthWP_modern_flow] - Exception: {str(e)}")
+        pp.error("Login failed to Microsoft 365 Web Portal.")
+        return False
+
+def authWP_browser_fallback(device, username, password, user_agent, session, headers):
+    """Browser-based authentication fallback"""
+    if args.debug:
+        pp.debug(f"[AuthWP_browser_fallback] - Using browser-based fallback")
+    
+    try:
+        # Step 1: Get the login form first
+        login_form_url = "https://login.microsoftonline.com/common/oauth2/authorize?client_id=00000002-0000-0ff1-ce00-000000000000&response_type=code&redirect_uri=https%3A%2F%2Foutlook.office365.com%2Fowa%2F&response_mode=query&scope=openid"
+        
+        form_response = session.get(login_form_url, headers=headers)
+        if args.debug:
+            pp.debug(f"[AuthWP_browser_fallback - Form]: Status {form_response.status_code}")
+            pp.debug(f"[AuthWP_browser_fallback - Form]: URL {form_response.url}")
+            pp.debug(f"[AuthWP_browser_fallback - Form]: Response snippet: {form_response.text[:1000]}...")
+        
+        if args.ioc:
+            req = (form_response.url, form_response.headers.get('date'))
+            iocs_instance.add_to_list(req)
+        
+        # Step 2: Try to extract any required tokens from the form
+        ctx = ""
+        flow_token = ""
+        
+        # Look for flowToken or sFT in the form
+        flow_patterns = [
+            re.compile(r'"flowToken":"([^"]*)"'),
+            re.compile(r'"sFT":"([^"]*)"'),
+            re.compile(r'value="([^"]*)"[^>]*name="flowToken"'),
+            re.compile(r'name="flowToken"[^>]*value="([^"]*)"')
+        ]
+        
+        for pattern in flow_patterns:
+            matches = pattern.findall(form_response.text)
+            if matches:
+                flow_token = matches[0]
+                if args.debug:
+                    pp.debug(f"[AuthWP_browser_fallback] - Found flow token: {flow_token[:50]}...")
+                break
+        
+        # Look for ctx token and other required parameters
+        ctx_patterns = [
+            re.compile(r'"ctx":"([^"]*)"'),
+            re.compile(r'value="([^"]*)"[^>]*name="ctx"'),
+            re.compile(r'name="ctx"[^>]*value="([^"]*)"'),
+            re.compile(r'"originalRequest":"([^"]*)"'),
+            re.compile(r'"correlationId":"([^"]*)"'),
+            re.compile(r'"sessionId":"([^"]*)"')
+        ]
+        
+        for pattern in ctx_patterns:
+            matches = pattern.findall(form_response.text)
+            if matches:
+                ctx = matches[0]
+                if args.debug:
+                    pp.debug(f"[AuthWP_browser_fallback] - Found ctx: {ctx[:50]}...")
+                break
+        
+        # Also look for other important form fields that might be required
+        canary = ""
+        canary_patterns = [
+            re.compile(r'"canary":"([^"]*)"'),
+            re.compile(r'value="([^"]*)"[^>]*name="canary"'),
+            re.compile(r'name="canary"[^>]*value="([^"]*)"')
+        ]
+        
+        for pattern in canary_patterns:
+            matches = pattern.findall(form_response.text)
+            if matches:
+                canary = matches[0]
+                if args.debug:
+                    pp.debug(f"[AuthWP_browser_fallback] - Found canary: {canary[:50]}...")
+                break
+        
+        # Step 3: Submit login with extracted tokens
+        login_url = "https://login.microsoftonline.com/common/login"
+        
+        form_data = {
+            "login": username,
+            "loginfmt": username,
+            "passwd": password,
+            "LoginOptions": "3",
+            "type": "11",
+            "ctx": ctx,
+            "flowToken": flow_token,
+            "canary": canary,
+            "i13": "0",
+            "ps": "2",
+            "NewUser": "1",
+            "FoundMSAs": "",
+            "fspost": "0",
+            "i21": "0",
+            "CookieDisclosure": "0",
+            "IsFidoSupported": "1",
+            "isSignupPost": "0",
+            "i2": "1"
+        }
+        
+        # Remove empty values but keep required fields even if empty
+        required_fields = ["login", "loginfmt", "passwd", "flowToken", "LoginOptions", "type"]
+        form_data = {k: v for k, v in form_data.items() if v or k in required_fields}
+        
+        response = session.post(login_url, data=form_data, headers=headers, allow_redirects=True)
+        if args.debug:
+            pp.debug(f"[AuthWP_browser_fallback - Login]: Response status {response.status_code}")
+            pp.debug(f"[AuthWP_browser_fallback - Login]: Response URL {response.url}")
+            pp.debug(f"[AuthWP_browser_fallback - Login]: Cookies: {[c.name for c in session.cookies]}")
+        
+        if args.ioc:
+            req = (response.url, response.headers.get('date'))
+            iocs_instance.add_to_list(req)
+        
+        # Check for authentication success indicators
+        auth_cookies = ["ESTSAUTH", "ESTSAUTHPERSISTENT", "ESTSAUTHLIGHT"]
+        has_auth_cookie = any(cookie.name in auth_cookies for cookie in session.cookies)
+        
+        if has_auth_cookie:
+            pp.success(f"SUCCESS! {username} was able to authenticate to the Microsoft 365 Web Portal. Checking MFA now...")
+            
+            # Check for MFA indicators in response
+            response_lower = response.text.lower()
+            if "stay signed in" in response_lower or "keep me signed in" in response_lower:
+                pp.success("It appears there is no MFA for this account.")
+                pp.success(f"Login with a {device}-based web browser to https://outlook.office365.com. Ex: {user_agent}")
+                return True
+            elif "verify your identity" in response_lower or "approve sign in request" in response_lower or "multi-factor" in response_lower:
+                pp.error("MFA for Microsoft 365 via the web portal is enabled.")
+                return False
+            else:
+                # Successful login but unsure about MFA status
+                pp.success("Authentication successful, but MFA status unclear.")
+                return True
+        else:
+            # Check response for authentication errors or MFA requirements
+            response_lower = response.text.lower()
+            
+            # Check for common authentication error codes in response
+            if "aadsts50126" in response_lower:
+                pp.error("Invalid username or password.")
+                return False
+            elif "aadsts50079" in response_lower or "aadsts50076" in response_lower:
+                pp.error(f"SUCCESS! {username} was able to authenticate to the Microsoft 365 Web Portal - NOTE: MFA is enabled.")
+                return False
+            elif "verify your identity" in response_lower or "multi-factor" in response_lower:
+                pp.error(f"SUCCESS! {username} was able to authenticate to the Microsoft 365 Web Portal - NOTE: MFA is enabled.")
+                return False
+            else:
+                # Check if this is a context parsing error and try modern flow
+                response_lower = response.text.lower()
+                if "aadsts900043" in response_lower or "bad request" in response_lower or "context cannot be parsed" in response_lower:
+                    if args.debug:
+                        pp.debug(f"[AuthWP_browser_fallback] - Context parsing error, trying modern flow")
+                    return authWP_modern_flow(device, username, password, user_agent, session, headers)
+                else:
+                    if args.debug:
+                        pp.debug(f"[AuthWP_browser_fallback] - Response text: {response.text[:2000]}...")
+                    pp.error("Login failed to Microsoft 365 Web Portal.")
+                    return False
+    
+    except Exception as e:
+        if args.debug:
+            pp.debug(f"[AuthWP_browser_fallback] - Exception: {str(e)}")
+        # Try modern flow as last resort
+        return authWP_modern_flow(device, username, password, user_agent, session, headers)
+
 def authWP(device, username, password, user_agent):
     pp.info(f"=== Logging into Microsoft Web Portal with {device} User Agent ===")
     o365 = requests.Session()
     headers = {"User-Agent": user_agent}
-    response = o365.get('https://outlook.office365.com', headers=headers)
+    
+    # Step 1: Get redirected to Microsoft login page
+    response = o365.get('https://outlook.office365.com', headers=headers, allow_redirects=False)
     if args.debug:
-        pp.debug(f"[AuthWP - Create Session]: {response.text}")
+        pp.debug(f"[AuthWP - Initial Response]: Status: {response.status_code}, Headers: {response.headers}")
     if args.ioc:
         req = (response.url, response.headers.get('date'))
         iocs_instance.add_to_list(req)
+    
+    # Check if we got redirected to login
+    if response.status_code in [302, 301] and 'location' in response.headers:
+        login_url = response.headers['location']
         if args.debug:
-            pp.debug(f"[AuthWP - add IOC {req}")
-    partialctx_pattern = re.compile(r'urlLogin":".*?"')
-    partialctx = partialctx_pattern.findall(response.text)
-    ctx_pattern = re.compile(r'ctx=.*?"')
-    ctx = ctx_pattern.findall(partialctx[0])[0].replace('ctx=', '').replace('"', '')
-    sft_pattern = re.compile(r'sFT":".*?"')
-    sft = sft_pattern.findall(response.text)[0].replace('sFT":"', '').replace('"', '')
-    userform = {
-        "username": username,
-        "isOtherIdpSupported": "false",
-        "checkPhones": "false",
-        "isRemoteNGCSupported": "true",
-        "isCookieBannerShown": "false",
-        "isFidoSupported": "true",
-        "originalRequest": ctx,
-        "country": "US", 
-        "forceotclogin": "false",
-        "isExternalFederationDisallowed": "false",
-        "isRemoteConnectSupported": "false",
-        "federationFlags": "0",
-        "isSignup": "false",
-        "flowToken": sft,
-        "isAccessPassSupported": "true"
-    }
-    json_form = json.dumps(userform)
-    url = "https://login.microsoftonline.com/common/GetCredentialType?mkt=en-US"
-    response = o365.post(url, headers=headers, json=json_form)
+            pp.debug(f"[AuthWP - Redirect]: {login_url}")
+    else:
+        # Try to get login URL directly
+        login_url = 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=00000002-0000-0ff1-ce00-000000000000&response_type=code&redirect_uri=https%3A%2F%2Foutlook.office365.com%2Fowa%2F&response_mode=query&scope=https%3A%2F%2Foutlook.office365.com%2F.default&state=loginrequest'
+        if args.debug:
+            pp.debug(f"[AuthWP - Using direct login URL]: {login_url}")
+    
+    # Step 2: Get the login page
+    response = o365.get(login_url, headers=headers)
+    if args.debug:
+        pp.debug(f"[AuthWP - Login Page]: {response.text[:2000]}...")
+    if args.ioc:
+        req = (response.url, response.headers.get('date'))
+        iocs_instance.add_to_list(req)
+    
+    # Extract required tokens from the new login flow
+    try:
+        # Look for flowToken in script tags or data attributes
+        flow_token_patterns = [
+            re.compile(r'"flowToken":"([^"]*)"'),
+            re.compile(r'flowToken["\s]*:["\s]*"([^"]*)"'),
+            re.compile(r'data-flow-token="([^"]*)"'),
+            re.compile(r'"sFT":"([^"]*)"'),
+            re.compile(r'sFT["\s]*:["\s]*"([^"]*)"')
+        ]
+        
+        flow_token = None
+        for pattern in flow_token_patterns:
+            matches = pattern.findall(response.text)
+            if matches:
+                flow_token = matches[0]
+                if args.debug:
+                    pp.debug(f"[AuthWP - Found flowToken]: {flow_token[:50]}...")
+                break
+        
+        # Look for ctx/correlationId
+        ctx_patterns = [
+            re.compile(r'"ctx":"([^"]*)"'),
+            re.compile(r'ctx["\s]*:["\s]*"([^"]*)"'),
+            re.compile(r'"correlationId":"([^"]*)"'),
+            re.compile(r'correlationId["\s]*:["\s]*"([^"]*)"'),
+            re.compile(r'data-ctx="([^"]*)"')
+        ]
+        
+        ctx = None
+        for pattern in ctx_patterns:
+            matches = pattern.findall(response.text)
+            if matches:
+                ctx = matches[0]
+                if args.debug:
+                    pp.debug(f"[AuthWP - Found ctx]: {ctx[:50]}...")
+                break
+        
+        # If we can't find tokens, try a different approach using the current Microsoft login API
+        if not flow_token:
+            if args.debug:
+                pp.debug(f"[AuthWP - No tokens found, trying direct auth approach]")
+            return authWP_direct(device, username, password, user_agent, o365, headers)
+        
+        # Continue with traditional flow if we found tokens
+        userform = {
+            "username": username,
+            "isOtherIdpSupported": "false",
+            "checkPhones": "false",
+            "isRemoteNGCSupported": "true",
+            "isCookieBannerShown": "false",
+            "isFidoSupported": "true",
+            "originalRequest": ctx or "",
+            "country": "US", 
+            "forceotclogin": "false",
+            "isExternalFederationDisallowed": "false",
+            "isRemoteConnectSupported": "false",
+            "federationFlags": "0",
+            "isSignup": "false",
+            "flowToken": flow_token,
+            "isAccessPassSupported": "true"
+        }
+        json_form = json.dumps(userform)
+        url = "https://login.microsoftonline.com/common/GetCredentialType?mkt=en-US"
+        response = o365.post(url, headers=headers, json=json_form)
+        
+    except Exception as e:
+        pp.error(f"Error extracting authentication tokens: {str(e)}")
+        if args.debug:
+            pp.debug(f"Exception details: {e}")
+        return False
     if args.debug:
         pp.debug(f"[AuthWP - response]: {response.text}")
     if args.ioc:
@@ -364,9 +790,9 @@ def authWP(device, username, password, user_agent):
         "psRNGCEntropy": "",
         "psRNGCSLK": "",
         "canary": "",
-        "ctx": ctx,
+        "ctx": ctx or "",
         "hpgrequestid": "",
-        "flowToken": sft,
+        "flowToken": flow_token or "",
         "NewUser": "1",
         "FoundMSAs": "",
         "fspost": "0",
