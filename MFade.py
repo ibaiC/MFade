@@ -161,25 +161,94 @@ def reconADFS(username):
 def authADFS(username, password):
     pp.info("Logging into ADFS")
     root_adfs_url, adfs_domain = reconADFS(username)
+    
+    # Check if ADFS is available before proceeding
+    if not root_adfs_url or not adfs_domain:
+        pp.error("ADFS is not available for this domain. Cannot perform ADFS authentication.")
+        return False
+    
     try:
         adfs_session = requests.Session()
         adfs_session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'})
         response = adfs_session.get(root_adfs_url.geturl())
+        
+        if args.debug:
+            pp.debug(f"[authADFS] ADFS page response: {response.status_code}")
+        
         soup = BeautifulSoup(response.text, 'html.parser')
         userform = soup.find('form')
-        userform.find('input', {'name': 'UserName'})['value'] = username
-        userform.find('input', {'name': 'Password'})['value'] = password
-        userform.find('input', {'name': 'AuthMethod'})['value'] = "FormsAuthentication"
-        adfsauthpath = userform['action']
+        
+        if not userform:
+            pp.error("Could not find ADFS login form on the page.")
+            return False
+        
+        # Check for required form fields
+        username_field = userform.find('input', {'name': 'UserName'})
+        password_field = userform.find('input', {'name': 'Password'})
+        auth_method_field = userform.find('input', {'name': 'AuthMethod'})
+        
+        if not username_field or not password_field:
+            pp.error("Could not find required username/password fields in ADFS form.")
+            return False
+        
+        # Build form data manually
+        form_data = {}
+        
+        # Get all form inputs and their current values
+        for input_field in userform.find_all(['input', 'select', 'textarea']):
+            field_name = input_field.get('name')
+            if field_name:
+                field_value = input_field.get('value', '')
+                form_data[field_name] = field_value
+        
+        # Set our authentication values
+        form_data['UserName'] = username
+        form_data['Password'] = password
+        if auth_method_field:
+            form_data['AuthMethod'] = "FormsAuthentication"
+        
+        # Get form action
+        adfsauthpath = userform.get('action', '')
+        if not adfsauthpath:
+            pp.error("Could not find ADFS form action URL.")
+            return False
+            
         full_adfs_url = f"https://{adfs_domain}{adfsauthpath}"
-        adfs_auth_attempt = adfs_session.post(full_adfs_url, data=userform.fields)
+        
+        if args.debug:
+            pp.debug(f"[authADFS] Submitting to: {full_adfs_url}")
+            pp.debug(f"[authADFS] Form data keys: {list(form_data.keys())}")
+        
+        adfs_auth_attempt = adfs_session.post(full_adfs_url, data=form_data)
         if "MSISAUTH" in [cookie.name for cookie in adfs_session.cookies]:
             pp.success("Success! We can authenticate to ADFS.")
             pp.warning("NOTE: This part may open a browser. If closed immediately it may prevent an SMS/call to the user.")
             for i in range(5, 0, -1):
-                pp.warning("Sending Auth Request in {i}...\r", end="")
+                pp.warning(f"Sending Auth Request in {i}...\r", end="")
                 time.sleep(1)
-            adfs_srf_auth = adfs_session.post("https://login.microsoftonline.com/login.srf", data=adfs_auth_attempt.forms[0].fields, allow_redirects=False)
+            
+            # Parse the ADFS response to extract any required form data for Microsoft login
+            adfs_soup = BeautifulSoup(adfs_auth_attempt.text, 'html.parser')
+            srf_form = adfs_soup.find('form')
+            
+            if srf_form:
+                # Extract form data from ADFS response
+                srf_form_data = {}
+                for input_field in srf_form.find_all(['input', 'select', 'textarea']):
+                    field_name = input_field.get('name')
+                    if field_name:
+                        field_value = input_field.get('value', '')
+                        srf_form_data[field_name] = field_value
+                
+                if args.debug:
+                    pp.debug(f"[authADFS] SRF form data keys: {list(srf_form_data.keys())}")
+                
+                adfs_srf_auth = adfs_session.post("https://login.microsoftonline.com/login.srf", data=srf_form_data, allow_redirects=False)
+            else:
+                # If no form found, try without additional data
+                if args.debug:
+                    pp.debug(f"[authADFS] No form found in ADFS response, trying direct SRF request")
+                adfs_srf_auth = adfs_session.post("https://login.microsoftonline.com/login.srf", allow_redirects=False)
             if "Stay signed in" in adfs_srf_auth.text:
                 pp.success("There is no MFA for this account.")
                 pp.success(f"Login with a web browser to {full_adfs_url}")
@@ -191,16 +260,20 @@ def authADFS(username, password):
                 elif "Verify your identity" in adfs_srf_auth.text:
                     pp.warning("MFA is configured.")
             if args.ioc:
-                for h in adfs_session:
-                    print(h.url)
-                    print(h.headers.get('date'))
-                    req = (h.url, h.headers.get('date'))
-                    iocs_instance.add_to_list(req)
+                # Add IOC entries for the ADFS authentication requests
+                req1 = (response.url, response.headers.get('date'))
+                req2 = (adfs_auth_attempt.url, adfs_auth_attempt.headers.get('date'))
+                req3 = (adfs_srf_auth.url, adfs_srf_auth.headers.get('date'))
+                iocs_instance.add_to_list(req1)
+                iocs_instance.add_to_list(req2)
+                iocs_instance.add_to_list(req3)
             return True
         else:
             pp.error("Login failed.")
             return False
     except Exception as e:
+        if args.debug:
+            pp.debug(f"[authADFS] Exception details: {str(e)}")
         pp.error("ADFS authentication failed in an unexpected way. Aborting ADFS check.")
         return False
 
@@ -229,7 +302,7 @@ def authGAPI(username, password):
         iocs_instance.add_to_list(req)
     if response.status_code == 200:
         pp.success(f"Success! {username} is able to authenticate to the Microsoft Graph API")
-        pp.success("The MSOnline PowerShell module can be used to leverage this.")
+        pp.success("The MSOnline PowerShell module can be used to exploit this.")
         return True
     else:
         if "AADSTS50126" in response.text:
@@ -280,7 +353,7 @@ def authASM(username, password):
             pp.debug(f"[AuthASM - and IOC]:")
     if response.status_code == 200:
         pp.success(f"Success! {username} is able to authenticate to the Microsoft Service Management API")
-        pp.success("The Az PowerShell module can be used to leverage this.")
+        pp.success("The Az PowerShell module can be used to exploit this.")
         return True
     else:
         if "AADSTS50126" in response.text:
@@ -859,7 +932,7 @@ def authEWS(username, password):
         account = Account(primary_smtp_address=username, credentials=credentials, autodiscover=True)
         last_email = account.inbox.all().order_by('-datetime_received')[0]
         pp.success(f"SUCCESS! {username} was able to authenticate to Microsoft 365 EWS!")
-        pp.success("MailSniper can be used to leverage this. https://github.com/dafthack/MailSniper")
+        pp.success("MailSniper can be used to exploit this. https://github.com/dafthack/MailSniper")
         return True
     except:
         pp.error("Login failed to Exchange Web Services")
